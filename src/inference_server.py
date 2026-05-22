@@ -307,8 +307,6 @@ class TTSServer:
     def generate(self, prompt, voice_ref=None, cfg_scale=2.5, stg_scale=1.5,
                  duration_multiplier=1.1, seed=42, ref_duration=10.0,
                  rescale_scale="auto", gen_duration: float = 0.0,
-                 upsampler: str = "ltx",
-                 sr_kwargs: dict | None = None,
                  denoise_ref: bool = True):
         """Generate audio. Returns (waveform_path, duration_seconds).
 
@@ -317,20 +315,10 @@ class TTSServer:
             float in [0, 1] for a fixed override, or 0 to disable.
         gen_duration: explicit target duration in seconds. 0 (default) → auto
             from prompt + duration_multiplier; >0 overrides everything else.
-        upsampler: which 24→48 kHz stage to use. "ltx" (default) keeps the
-            built-in VocoderWithBWE; "ap_bwe", "audiosr", and "reuse" bypass
-            the LTX BWE residual and route the base 24 kHz waveform through
-            the external super-resolver loaded via
-            super_resolution.make_upsampler().
-        sr_kwargs: kwargs forwarded to make_upsampler() on first use (e.g.
-            {"chunk_size_s": 1.0, "hop_portion": 0.5} for reuse,
-            {"checkpoint_path": ...} for ap_bwe, {"model_name": "speech",
-            "ddim_steps": 50} for audiosr).
         denoise_ref: when True (default) and a voice reference is provided,
-            RE-USE is applied to the *reference* before VAE encoding rather
-            than to the generated output. This preserves paralinguistic
-            content (laughs, gasps, sighs, breaths) the model generates —
-            output-side denoising tends to suppress them as broadband noise.
+            RE-USE is applied to the *reference* before VAE encoding so the
+            model conditions on a clean speaker / style anchor. Generated
+            output (24→48 kHz) always goes through the LTX BigVGAN BWE.
         """
         t_total = time.time()
 
@@ -441,29 +429,9 @@ class TTSServer:
             latent = patched
 
         t0 = time.time()
-        if upsampler == "ltx":
-            decoded = self._audio_decoder(latent)
-            out_waveform, out_sr = decoded.waveform, decoded.sampling_rate
-            logging.info(f"Decode (LTX BWE): {time.time()-t0:.2f}s")
-        else:
-            # Lazy-create and cache the chosen external upsampler on `self`
-            # so repeat calls don't reload weights.
-            from super_resolution import decode_base_24k, make_upsampler
-            cache_key = f"_sr_{upsampler}"
-            if not hasattr(self, cache_key) or getattr(self, cache_key) is None:
-                kw = dict(sr_kwargs or {})
-                kw.setdefault("device", self.device)
-                setattr(self, cache_key, make_upsampler(upsampler, **kw))
-            sr_model = getattr(self, cache_key)
-
-            wav_24k, base_sr = decode_base_24k(self._audio_decoder, latent)
-            t_base = time.time() - t0
-            t1 = time.time()
-            out_waveform, out_sr = sr_model(wav_24k, in_sr=base_sr)
-            logging.info(
-                f"Decode (base {base_sr} Hz): {t_base:.2f}s + "
-                f"{upsampler} -> {out_sr} Hz: {time.time()-t1:.2f}s"
-            )
+        decoded = self._audio_decoder(latent)
+        out_waveform, out_sr = decoded.waveform, decoded.sampling_rate
+        logging.info(f"Decode (LTX BWE): {time.time()-t0:.2f}s")
 
         total = time.time() - t_total
         dur = out_waveform.shape[-1] / out_sr

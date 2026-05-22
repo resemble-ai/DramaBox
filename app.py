@@ -198,7 +198,7 @@ def preview_chunks(prompt: str, dur_mult: float, max_chunk_s: float,
 
 @spaces.GPU(duration=600)
 def on_generate(prompt: str, audio_ref, cfg: float, stg: float, dur_mult: float,
-                gen_dur: float, ref_dur: float, seed: int, upsampler: str,
+                gen_dur: float, ref_dur: float, seed: int,
                 denoise_ref: bool,
                 max_chunk_s: float, target_chunk_s: float, crossfade_ms: float,
                 progress=gr.Progress()):
@@ -207,10 +207,8 @@ def on_generate(prompt: str, audio_ref, cfg: float, stg: float, dur_mult: float,
     t0 = time.time()
     ref_path = audio_ref if audio_ref and os.path.exists(str(audio_ref)) else None
     output = tempfile.mktemp(suffix=".wav", prefix="dramabox_", dir="output")
-    sr_kwargs = {"chunk_size_s": 1.0, "hop_portion": 0.5} if upsampler == "reuse" else None
 
     def _on_chunk(idx: int, total: int, est_s: float) -> None:
-        # idx is 0-indexed; show as "chunk 1/N starting".
         if total <= 1:
             progress(0.0, desc=f"Generating ~{est_s:.1f} s of audio")
         else:
@@ -225,8 +223,6 @@ def on_generate(prompt: str, audio_ref, cfg: float, stg: float, dur_mult: float,
         duration_multiplier=dur_mult, seed=int(seed),
         gen_duration=float(gen_dur),
         ref_duration=float(ref_dur),
-        upsampler=upsampler,
-        sr_kwargs=sr_kwargs,
         denoise_ref=bool(denoise_ref),
         max_chunk_duration=float(max_chunk_s),
         target_chunk_duration=float(target_chunk_s),
@@ -234,7 +230,7 @@ def on_generate(prompt: str, audio_ref, cfg: float, stg: float, dur_mult: float,
         progress_callback=_on_chunk,
     )
     elapsed = time.time() - t0
-    logging.info(f"Generated in {elapsed:.2f}s ({upsampler}, denoise_ref={denoise_ref}) -> {output}")
+    logging.info(f"Generated in {elapsed:.2f}s (denoise_ref={denoise_ref}) -> {output}")
     return output
 
 
@@ -324,18 +320,6 @@ with gr.Blocks(
                                            label="Reference duration (s) — how many seconds of the "
                                                  "uploaded voice reference the model conditions on")
                 seed_input = gr.Number(value=42, label="Seed", precision=0)
-                upsampler_choice = gr.Radio(
-                    choices=[
-                        ("LTX BigVGAN BWE (built-in, fast — recommended)", "ltx"),
-                        ("RE-USE — output-side denoise + 48 kHz (suppresses laughs/sighs)", "reuse"),
-                    ],
-                    value="ltx",
-                    label="24→48 kHz upsampler",
-                    info=("Default = LTX BWE. RE-USE on the OUTPUT tends to suppress "
-                          "paralinguistic events (laughs, gasps, sighs) as broadband noise. "
-                          "We now run RE-USE on the *reference* instead (see below) — that "
-                          "gives clean speaker identity without touching generated content."),
-                )
                 denoise_ref_check = gr.Checkbox(
                     value=True,
                     label="Denoise voice reference (RE-USE on input)",
@@ -400,7 +384,7 @@ with gr.Blocks(
         on_generate,
         inputs=[prompt_box, audio_ref, cfg_slider, stg_slider,
                 dur_slider, gen_dur_slider, ref_dur_slider, seed_input,
-                upsampler_choice, denoise_ref_check,
+                denoise_ref_check,
                 max_chunk_slider, target_chunk_slider, crossfade_slider],
         outputs=[audio_out],
     )
@@ -411,11 +395,9 @@ with gr.Blocks(
         label="🎬 Click any row to generate a sample",
         examples=[
             # rows tagged "30s •" force a 30-second target duration; the rest
-            # use the prompt-driven auto estimate (gen_dur = 0). New pipeline:
-            # upsampler="ltx" (no output denoise) + denoise_ref=True
-            # (input-side RE-USE) keeps generated laughs / sighs intact.
+            # use the prompt-driven auto estimate (gen_dur = 0).
             [name, prompt, voice_path, 2.5, 1.5, 1.1,
-             30.0 if name.startswith("30s") else 0.0, 10.0, 42, "ltx", True,
+             30.0 if name.startswith("30s") else 0.0, 10.0, 42, True,
              45.0, 37.0, 50.0]
             for name, voice_path, prompt in EXAMPLES
         ],
@@ -423,12 +405,12 @@ with gr.Blocks(
         inputs=[gr.Textbox(visible=False, label="Scene"),
                 prompt_box, audio_ref,
                 cfg_slider, stg_slider, dur_slider, gen_dur_slider,
-                ref_dur_slider, seed_input, upsampler_choice, denoise_ref_check,
+                ref_dur_slider, seed_input, denoise_ref_check,
                 max_chunk_slider, target_chunk_slider, crossfade_slider],
         outputs=[audio_out],
-        fn=lambda _name, prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed, ups,
+        fn=lambda _name, prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed,
                   dn_ref, max_ch, tgt_ch, xfade: on_generate(
-            prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed, ups, dn_ref,
+            prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed, dn_ref,
             max_ch, tgt_ch, xfade),
         cache_examples=False,
         run_on_click=True,

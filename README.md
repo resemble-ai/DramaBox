@@ -110,49 +110,22 @@ print(detector.get_watermark(wav, sample_rate=sr))   # confidence ≈ 1.0
 
 Pass `--no-watermark` to `inference.py` (or `watermark=False` to `generate_to_file`) to disable for debugging.
 
-## Speech enhancement (RE-USE on the reference, not the output)
+## Voice reference denoising (RE-USE)
 
-DramaBox uses [`nvidia/RE-USE`](https://huggingface.co/nvidia/RE-USE) — a 9.6 M-param bidirectional-Mamba universal speech enhancer — on the **input voice reference** rather than the generated output.
-
-### Why preprocess, not post-process
-
-Output-side denoising (RE-USE applied to the final waveform) suppresses paralinguistic events the model generates — laughs (`"Hahaha"`), gasps, sighs, breaths, vocal fry — because they're broadband, non-tonal events that look like noise to a universal enhancer.
-
-Running RE-USE on the **reference** instead gives the audio VAE a clean speaker / style anchor to condition on. The model then generates clean speech from a clean prior, and the generated paralinguistic content is never touched by an enhancer.
-
-| Pipeline | Speaker clarity | Generated laughs / sighs |
-|---|---|---|
-| LTX BWE only | depends on ref noise | preserved |
-| RE-USE on output | clean | **suppressed** |
-| RE-USE on reference (default) | clean | preserved |
-
-### Setup is automatic
-
-First call to `REUSEUpsampler` invokes `model_downloader.get_reuse_code_path()`, which:
-
-1. Honors `$REUSE_DIR` if set,
-2. Falls back to `third_party/RE-USE/` if you cloned it manually, otherwise
-3. Snapshot-downloads only the code (`.py` / `.yaml` / `.json`, ~150 KB) into `~/.cache/dramabox/`.
-
-Weights (`model.safetensors`, ~38 MB) are pulled separately by `SEMamba.from_pretrained("nvidia/RE-USE")` through the standard HF cache.
-
-The bi-Mamba SSM uses CUDA kernels from [`mamba-ssm`](https://github.com/state-spaces/mamba) + [`causal-conv1d`](https://github.com/Dao-AILab/causal-conv1d). Those are listed as optional in `requirements.txt`; if their wheels won't build for your CUDA toolkit, the wrapper transparently swaps in the pure-PyTorch `selective_scan_ref` reference path (5-10× slower but functionally identical). If RE-USE fails to load entirely (e.g. missing weights), reference denoising is silently skipped — generation still works, just with a raw reference.
+The voice reference is denoised with [`nvidia/RE-USE`](https://huggingface.co/nvidia/RE-USE) before VAE conditioning. On (defaults to `True`):
 
 ```python
-from src.inference_server import TTSServer
-server = TTSServer(device="cuda")
 server.generate_to_file(
-    prompt='A woman speaks warmly, "Hello." She laughs, "Hahaha!"',
+    prompt='A woman speaks warmly, "Hello."',
     output="out.wav",
     voice_ref="ref.wav",
-    upsampler="ltx",        # LTX BigVGAN BWE — fast, leaves laughs intact
-    denoise_ref=True,       # RE-USE on the reference (default)
+    denoise_ref=True,
 )
 ```
 
-The denoised reference is cached per `(path, ref_duration, sampling_rate)` on the server instance, so chunked generations don't re-denoise the same 10 s clip per chunk.
+Setup is automatic — code (`.py` / `.yaml`, ~150 KB) is snapshot-downloaded into `~/.cache/dramabox/` on first call; weights (`~38 MB`) come from `SEMamba.from_pretrained` through the standard HF cache. Pass `$REUSE_DIR` or vendor at `third_party/RE-USE/` to skip the download.
 
-> RE-USE is released under [NVIDIA's NSCLv1](https://github.com/NVlabs/HMAR/blob/main/LICENSE) (research / non-commercial). Pass `denoise_ref=False` for commercial-only deployments — the LTX BWE path is unencumbered.
+Optional kernels: `mamba-ssm` + `causal-conv1d`. If their wheels fail to build, the wrapper falls back to a pure-PyTorch path (5-10× slower, same output). RE-USE is [NSCLv1](https://github.com/NVlabs/HMAR/blob/main/LICENSE) (non-commercial) — set `denoise_ref=False` to skip.
 
 ## Long-form generation (text chunking)
 

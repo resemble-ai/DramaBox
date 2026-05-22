@@ -6,3 +6,16 @@ __pycache__/
 models/*.safetensors
 *.log
 .DS_Store
+
+# Vendored third-party trees fetched at install time (RE-USE, AP-BWE, AudioSR).
+# Code/configs are re-snapshotted on demand via src/model_downloader.py:get_reuse_code_path.
+third_party/
+
+# Generated audio + Gradio runtime cache.
+output/*.wav
+output/*.mp3
+.gradio/
+
+# Slurm job artifacts.
+run_app-*.err
+run_app-*.out

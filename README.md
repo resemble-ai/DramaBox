@@ -110,6 +110,64 @@ print(detector.get_watermark(wav, sample_rate=sr))   # confidence ≈ 1.0
 
 Pass `--no-watermark` to `inference.py` (or `watermark=False` to `generate_to_file`) to disable for debugging.
 
+## Speech enhancement (RE-USE on the reference, not the output)
+
+DramaBox uses [`nvidia/RE-USE`](https://huggingface.co/nvidia/RE-USE) — a 9.6 M-param bidirectional-Mamba universal speech enhancer — on the **input voice reference** rather than the generated output.
+
+### Why preprocess, not post-process
+
+Output-side denoising (RE-USE applied to the final waveform) suppresses paralinguistic events the model generates — laughs (`"Hahaha"`), gasps, sighs, breaths, vocal fry — because they're broadband, non-tonal events that look like noise to a universal enhancer.
+
+Running RE-USE on the **reference** instead gives the audio VAE a clean speaker / style anchor to condition on. The model then generates clean speech from a clean prior, and the generated paralinguistic content is never touched by an enhancer.
+
+| Pipeline | Speaker clarity | Generated laughs / sighs |
+|---|---|---|
+| LTX BWE only | depends on ref noise | preserved |
+| RE-USE on output | clean | **suppressed** |
+| RE-USE on reference (default) | clean | preserved |
+
+### Setup is automatic
+
+First call to `REUSEUpsampler` invokes `model_downloader.get_reuse_code_path()`, which:
+
+1. Honors `$REUSE_DIR` if set,
+2. Falls back to `third_party/RE-USE/` if you cloned it manually, otherwise
+3. Snapshot-downloads only the code (`.py` / `.yaml` / `.json`, ~150 KB) into `~/.cache/dramabox/`.
+
+Weights (`model.safetensors`, ~38 MB) are pulled separately by `SEMamba.from_pretrained("nvidia/RE-USE")` through the standard HF cache.
+
+The bi-Mamba SSM uses CUDA kernels from [`mamba-ssm`](https://github.com/state-spaces/mamba) + [`causal-conv1d`](https://github.com/Dao-AILab/causal-conv1d). Those are listed as optional in `requirements.txt`; if their wheels won't build for your CUDA toolkit, the wrapper transparently swaps in the pure-PyTorch `selective_scan_ref` reference path (5-10× slower but functionally identical). If RE-USE fails to load entirely (e.g. missing weights), reference denoising is silently skipped — generation still works, just with a raw reference.
+
+```python
+from src.inference_server import TTSServer
+server = TTSServer(device="cuda")
+server.generate_to_file(
+    prompt='A woman speaks warmly, "Hello." She laughs, "Hahaha!"',
+    output="out.wav",
+    voice_ref="ref.wav",
+    upsampler="ltx",        # LTX BigVGAN BWE — fast, leaves laughs intact
+    denoise_ref=True,       # RE-USE on the reference (default)
+)
+```
+
+The denoised reference is cached per `(path, ref_duration, sampling_rate)` on the server instance, so chunked generations don't re-denoise the same 10 s clip per chunk.
+
+> RE-USE is released under [NVIDIA's NSCLv1](https://github.com/NVlabs/HMAR/blob/main/LICENSE) (research / non-commercial). Pass `denoise_ref=False` for commercial-only deployments — the LTX BWE path is unencumbered.
+
+## Long-form generation (text chunking)
+
+The base LTX-2.3 audio DiT was trained on clips ≤ ~20 s. Generations up to ~45 s remain usable thanks to the silence-prior patch in `inference_server.py`, but quality drifts past that. For arbitrarily long prompts, `TTSServer` now chunks automatically:
+
+```python
+server.generate_to_file(
+    prompt=very_long_scene,        # 2 minutes worth of dialogue is fine
+    output="long.wav",
+    voice_ref="ref.wav",           # reused across every chunk → speaker stays coherent
+)
+```
+
+The chunker (`src/text_chunker.py:chunk_prompt_for_duration`) splits at sentence / quote-group boundaries, preserves the speaker-description prefix on every chunk, and targets ~37 s per chunk (≤45 s hard cap). `TTSServer.generate_long` then concatenates the per-chunk waveforms with a 50 ms equal-power crossfade so joins are inaudible. Set `max_chunk_duration=` / `target_chunk_duration=` on `generate_to_file` to tune.
+
 ## Training a LoRA on top of DramaBox
 
 You can fine-tune your own LoRA using DramaBox itself as the base — no need to start from raw LTX-2.3. Useful for adding a specific speaker, language flavour, or style on top of the existing expressive prior.

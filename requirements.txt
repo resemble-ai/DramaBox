@@ -24,3 +24,15 @@ gradio==5.7.1
 spaces>=0.30.0
 soundfile>=0.12.0
 resemble-perth @ git+https://github.com/resemble-ai/Perth.git@master
+
+# ── Optional: NVIDIA RE-USE speech enhancement / 24→48 kHz BWE ───────────────
+# RE-USE is the default upsampler in app.py. resampy is used for its
+# pre-resample step; mamba_ssm + causal-conv1d power the bi-Mamba kernels.
+# The kernels have no pre-built wheels for every CUDA toolkit — installs may
+# need `--no-build-isolation` and matching CUDA + nvcc. If they fail to build,
+# REUSEUpsampler falls back to a pure-PyTorch reference path (~5-10x slower)
+# via super_resolution._ensure_mamba_ssm_importable.
+resampy>=0.4.0
+mamba-ssm>=2.2.0 ; platform_system == "Linux"
+causal-conv1d>=1.4.0 ; platform_system == "Linux"
+

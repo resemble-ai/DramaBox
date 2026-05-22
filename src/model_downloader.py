@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 DRAMABOX_REPO = "ResembleAI/Dramabox"
 GEMMA_REPO = "unsloth/gemma-3-12b-it-bnb-4bit"
+REUSE_REPO = "nvidia/RE-USE"
 
 # Default cache directory
 DEFAULT_CACHE = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~")), ".cache", "dramabox")
@@ -67,6 +68,42 @@ def get_gemma_path(cache_dir: str = None) -> str:
         repo_id=GEMMA_REPO,
         cache_dir=cache_dir,
         token=os.environ.get("HF_TOKEN"),
+    )
+    logger.info(f"  -> {local_dir}")
+    return local_dir
+
+
+def get_reuse_code_path(cache_dir: str = None) -> str:
+    """Fetch the nvidia/RE-USE code + configs needed by REUSEUpsampler.
+
+    Only the .py / .yaml / .json files are pulled (~150 KB) — the 38 MB
+    ``model.safetensors`` is intentionally skipped because
+    ``SEMamba.from_pretrained("nvidia/RE-USE", ...)`` re-downloads weights
+    through the standard HF cache on first instantiation, so vendoring them
+    here would just duplicate ~38 MB on disk.
+
+    Honors $REUSE_DIR for a pre-vendored copy (e.g. ``third_party/RE-USE/``):
+    if set and exists, that path is returned without touching the network.
+    Falls back to ``third_party/RE-USE/`` if it already contains the model
+    file, otherwise snapshot-downloads into the dramabox cache.
+    """
+    env_dir = os.environ.get("REUSE_DIR")
+    if env_dir and Path(env_dir).is_dir():
+        return env_dir
+
+    repo_root = Path(__file__).resolve().parent.parent
+    local_vendor = repo_root / "third_party" / "RE-USE"
+    if (local_vendor / "models" / "generator_SEMamba_time_d4.py").is_file():
+        return str(local_vendor)
+
+    cache_dir = cache_dir or DEFAULT_CACHE
+    logger.info(f"Fetching RE-USE code/configs from {REUSE_REPO}...")
+    local_dir = snapshot_download(
+        repo_id=REUSE_REPO,
+        cache_dir=cache_dir,
+        token=os.environ.get("HF_TOKEN"),
+        allow_patterns=["*.py", "*.yaml", "*.json",
+                        "recipes/*", "models/*.py", "utils/*.py"],
     )
     logger.info(f"  -> {local_dir}")
     return local_dir

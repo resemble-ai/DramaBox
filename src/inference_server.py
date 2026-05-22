@@ -14,6 +14,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 import torchaudio
@@ -53,11 +54,38 @@ DEFAULT_NEG = "worst quality, inconsistent, robotic, distorted, noise, static, m
 
 
 def estimate_duration(prompt, multiplier=1.1):
-    """Defer to the richer CLI estimator (sentence-aware + non-verbal action
-    budget) so warm-server outputs match the lengths of the per-call CLI runs."""
-    from inference import estimate_speech_duration
+    """Defer to the shared sentence-aware + non-verbal action budget estimator
+    so warm-server outputs match the lengths of the per-call CLI runs."""
+    from duration_estimator import estimate_speech_duration
     base = estimate_speech_duration(prompt)
     return max(3.0, round(base * multiplier, 1))
+
+
+def _equal_power_crossfade(prev: torch.Tensor, nxt: torch.Tensor,
+                           sample_rate: int, fade_ms: float = 50.0) -> torch.Tensor:
+    """Equal-power crossfade concat: ``[prev | nxt]`` with a smooth boundary.
+
+    Both tensors are (C, T). Returns (C, T_prev + T_nxt - T_fade).
+
+    Equal-power (cos/sin envelopes) keeps perceived loudness constant through
+    the join — unlike a linear fade, which dips by ~3 dB in the middle when
+    the two sources are uncorrelated. Default 50 ms is short enough to be
+    inaudible on speech while still masking any waveform-level discontinuity
+    between independently-generated chunks.
+    """
+    fade_samples = int(round(fade_ms * 1e-3 * sample_rate))
+    fade_samples = max(1, min(fade_samples, prev.shape[-1], nxt.shape[-1]))
+    if fade_samples <= 1:
+        return torch.cat([prev, nxt], dim=-1)
+
+    t = torch.linspace(0.0, 1.0, fade_samples, device=prev.device, dtype=prev.dtype)
+    fade_out = torch.cos(t * torch.pi / 2)   # 1.0 -> 0.0
+    fade_in = torch.sin(t * torch.pi / 2)    # 0.0 -> 1.0
+
+    prev_tail = prev[..., -fade_samples:] * fade_out
+    nxt_head = nxt[..., :fade_samples] * fade_in
+    mixed = prev_tail + nxt_head
+    return torch.cat([prev[..., :-fade_samples], mixed, nxt[..., fade_samples:]], dim=-1)
 
 
 def auto_rescale_for_cfg(cfg: float) -> float:
@@ -110,6 +138,11 @@ class TTSServer:
         self._velocity_model = None
         self._audio_conditioner = None
         self._audio_decoder = None
+        # RE-USE denoiser for the voice reference (input-side denoise).
+        # Lazy-loaded on first use; the cleaned-waveform cache below keeps
+        # chunked generations from re-denoising the same 10 s clip per chunk.
+        self._ref_denoiser = None
+        self._ref_denoise_cache: dict[tuple, "torch.Tensor"] = {}
 
         logging.info(f"TTSServer loading on {device}...")
         t0 = time.time()
@@ -203,10 +236,80 @@ class TTSServer:
         )
         logging.info(f"  AudioDecoder (warm): {time.time()-t0:.1f}s")
 
+    def _denoise_voice_ref(self, voice, voice_ref_path: str, ref_duration: float):
+        """Run RE-USE on the loaded voice reference and replace its waveform
+        with a cleaned mono signal.
+
+        Why pre-condition rather than post-generate: applying RE-USE to the
+        *output* suppresses paralinguistic events the model generates (laughs,
+        gasps, breaths, sighs) because they're broadband, non-tonal — exactly
+        what universal speech enhancement targets as "noise". Running it on
+        the *reference* instead gives the model a clean speaker / style
+        anchor, which it generalises from at inference time, while leaving
+        the generated paralinguistic content untouched.
+
+        Cached by ``(path, ref_duration, sampling_rate)`` so chunked
+        generations don't re-denoise the same 10 s clip per chunk.
+        """
+        cache_key = (voice_ref_path, float(ref_duration), int(voice.sampling_rate))
+        if cache_key in self._ref_denoise_cache:
+            return Audio(
+                waveform=self._ref_denoise_cache[cache_key],
+                sampling_rate=voice.sampling_rate,
+            )
+
+        # Lazy-load the denoiser. target_sr = input sr → no librosa resample
+        # round-trip; RE-USE does pure denoise. (The 48 kHz BWE that
+        # REUSEUpsampler can do is irrelevant here — the VAE conditioner
+        # resamples internally to whatever the audio branch expects.)
+        if self._ref_denoiser is None:
+            from super_resolution import REUSEUpsampler
+            try:
+                self._ref_denoiser = REUSEUpsampler(
+                    target_sr=int(voice.sampling_rate),
+                    device=self.device,
+                    chunk_size_s=1.0,
+                )
+            except Exception as e:
+                # Mamba kernels / weights missing → silently skip the denoise
+                # rather than blocking generation. Surfaces once per session.
+                logging.warning(f"Voice-ref denoise disabled (RE-USE unavailable: {e})")
+                self._ref_denoiser = False  # sentinel: don't retry this session
+                return voice
+
+        if self._ref_denoiser is False:
+            return voice
+
+        w = voice.waveform
+        # Collapse to mono — voice cloning is speaker-as-mono-source; we'll
+        # re-broadcast back to stereo after the conditioner.
+        if w.dim() == 3:
+            mono = w[0].mean(dim=0)
+        elif w.dim() == 2:
+            mono = w.mean(dim=0)
+        else:
+            mono = w
+        mono = mono.contiguous()
+
+        t0 = time.time()
+        cleaned, _ = self._ref_denoiser(mono, in_sr=int(voice.sampling_rate))
+        if cleaned.dim() == 2 and cleaned.shape[0] == 1:
+            cleaned = cleaned[0]
+        # Restore the (1, C=1, T) shape that the rest of the pipeline expects
+        # to consume — downstream code re-expands channels via repeat().
+        cleaned = cleaned.unsqueeze(0).unsqueeze(0).to(self.device, dtype=w.dtype)
+        logging.info(f"Voice-ref denoise (RE-USE): {time.time() - t0:.2f}s")
+
+        self._ref_denoise_cache[cache_key] = cleaned
+        return Audio(waveform=cleaned, sampling_rate=voice.sampling_rate)
+
     @torch.inference_mode()
     def generate(self, prompt, voice_ref=None, cfg_scale=2.5, stg_scale=1.5,
                  duration_multiplier=1.1, seed=42, ref_duration=10.0,
-                 rescale_scale="auto", gen_duration: float = 0.0):
+                 rescale_scale="auto", gen_duration: float = 0.0,
+                 upsampler: str = "ltx",
+                 sr_kwargs: dict | None = None,
+                 denoise_ref: bool = True):
         """Generate audio. Returns (waveform_path, duration_seconds).
 
         rescale_scale: latent-side CFG std-rescale that prevents clipping at
@@ -214,6 +317,20 @@ class TTSServer:
             float in [0, 1] for a fixed override, or 0 to disable.
         gen_duration: explicit target duration in seconds. 0 (default) → auto
             from prompt + duration_multiplier; >0 overrides everything else.
+        upsampler: which 24→48 kHz stage to use. "ltx" (default) keeps the
+            built-in VocoderWithBWE; "ap_bwe", "audiosr", and "reuse" bypass
+            the LTX BWE residual and route the base 24 kHz waveform through
+            the external super-resolver loaded via
+            super_resolution.make_upsampler().
+        sr_kwargs: kwargs forwarded to make_upsampler() on first use (e.g.
+            {"chunk_size_s": 1.0, "hop_portion": 0.5} for reuse,
+            {"checkpoint_path": ...} for ap_bwe, {"model_name": "speech",
+            "ddim_steps": 50} for audiosr).
+        denoise_ref: when True (default) and a voice reference is provided,
+            RE-USE is applied to the *reference* before VAE encoding rather
+            than to the generated output. This preserves paralinguistic
+            content (laughs, gasps, sighs, breaths) the model generates —
+            output-side denoising tends to suppress them as broadband noise.
         """
         t_total = time.time()
 
@@ -236,6 +353,8 @@ class TTSServer:
         if voice_ref and os.path.exists(voice_ref):
             t0 = time.time()
             voice = decode_audio_from_file(voice_ref, self.device, 0.0, ref_duration)
+            if denoise_ref:
+                voice = self._denoise_voice_ref(voice, voice_ref, ref_duration)
             w = voice.waveform
             if w.dim() == 2:
                 if w.shape[0] == 1:
@@ -322,16 +441,136 @@ class TTSServer:
             latent = patched
 
         t0 = time.time()
-        decoded = self._audio_decoder(latent)
-        logging.info(f"Decode: {time.time()-t0:.2f}s")
+        if upsampler == "ltx":
+            decoded = self._audio_decoder(latent)
+            out_waveform, out_sr = decoded.waveform, decoded.sampling_rate
+            logging.info(f"Decode (LTX BWE): {time.time()-t0:.2f}s")
+        else:
+            # Lazy-create and cache the chosen external upsampler on `self`
+            # so repeat calls don't reload weights.
+            from super_resolution import decode_base_24k, make_upsampler
+            cache_key = f"_sr_{upsampler}"
+            if not hasattr(self, cache_key) or getattr(self, cache_key) is None:
+                kw = dict(sr_kwargs or {})
+                kw.setdefault("device", self.device)
+                setattr(self, cache_key, make_upsampler(upsampler, **kw))
+            sr_model = getattr(self, cache_key)
+
+            wav_24k, base_sr = decode_base_24k(self._audio_decoder, latent)
+            t_base = time.time() - t0
+            t1 = time.time()
+            out_waveform, out_sr = sr_model(wav_24k, in_sr=base_sr)
+            logging.info(
+                f"Decode (base {base_sr} Hz): {t_base:.2f}s + "
+                f"{upsampler} -> {out_sr} Hz: {time.time()-t1:.2f}s"
+            )
 
         total = time.time() - t_total
-        dur = decoded.waveform.shape[-1] / decoded.sampling_rate
+        dur = out_waveform.shape[-1] / out_sr
         logging.info(f"Total: {total:.2f}s for {dur:.1f}s audio")
-        return decoded.waveform, decoded.sampling_rate
+        return out_waveform, out_sr
 
-    def generate_to_file(self, prompt, output, watermark: bool = True, **kwargs):
-        waveform, sr = self.generate(prompt, **kwargs)
+    @torch.inference_mode()
+    def generate_long(self, prompt, max_chunk_duration: float = 45.0,
+                      target_chunk_duration: float = 37.0,
+                      crossfade_ms: float = 50.0,
+                      progress_callback=None,
+                      **kwargs):
+        """Chunk-and-stitch generation for prompts whose estimated duration
+        exceeds ``max_chunk_duration``.
+
+        Splits ``prompt`` into <= ``max_chunk_duration`` chunks via
+        :func:`text_chunker.chunk_prompt_for_duration`, generates each one
+        through :meth:`generate` (same voice reference + seed for every
+        chunk, so speaker identity stays coherent across joins), and
+        concatenates the waveforms with an equal-power crossfade.
+
+        Returns ``(waveform, sample_rate)`` matching :meth:`generate`.
+        """
+        from text_chunker import chunk_prompt_for_duration
+
+        # gen_duration / duration_multiplier are per-chunk; pop them out so we
+        # control sizing here and forward only the per-chunk values.
+        per_chunk_mul = float(kwargs.pop("duration_multiplier", 1.1))
+        # gen_duration coming in as a global target only makes sense for the
+        # single-shot path; chunked generation derives durations per chunk.
+        kwargs.pop("gen_duration", None)
+
+        chunks = chunk_prompt_for_duration(
+            prompt,
+            max_duration_s=max_chunk_duration,
+            target_duration_s=target_chunk_duration,
+            duration_multiplier=per_chunk_mul,
+        )
+        logging.info(f"Long-form: {len(chunks)} chunks (target {target_chunk_duration:.0f}s, "
+                     f"max {max_chunk_duration:.0f}s)")
+
+        out_waveform: Optional[torch.Tensor] = None
+        out_sr: Optional[int] = None
+        t_total = time.time()
+        for idx, chunk in enumerate(chunks):
+            logging.info(f"  Chunk {idx + 1}/{len(chunks)}: est {chunk.est_duration_s:.1f}s, "
+                         f"{len(chunk.text)} chars")
+            if progress_callback is not None:
+                try:
+                    progress_callback(idx, len(chunks), chunk.est_duration_s)
+                except Exception as e:
+                    logging.warning(f"progress_callback raised, ignoring: {e}")
+            wav, sr = self.generate(
+                chunk.text,
+                duration_multiplier=per_chunk_mul,
+                **kwargs,
+            )
+            wav = wav.cpu().float()
+            if out_waveform is None:
+                out_waveform, out_sr = wav, sr
+            else:
+                if sr != out_sr:
+                    raise RuntimeError(f"Sample-rate mismatch between chunks: {out_sr} vs {sr}")
+                # Align channel counts: stereo crossfade with a mono buddy
+                # broadcasts cleanly via torch.cat after equalising dim 0.
+                if wav.shape[0] != out_waveform.shape[0]:
+                    if wav.shape[0] == 1:
+                        wav = wav.repeat(out_waveform.shape[0], 1)
+                    elif out_waveform.shape[0] == 1:
+                        out_waveform = out_waveform.repeat(wav.shape[0], 1)
+                out_waveform = _equal_power_crossfade(out_waveform, wav, out_sr,
+                                                      fade_ms=crossfade_ms)
+
+        total_dur = out_waveform.shape[-1] / out_sr
+        logging.info(f"Long-form total: {time.time() - t_total:.2f}s wall, {total_dur:.1f}s audio")
+        return out_waveform, out_sr
+
+    def generate_to_file(self, prompt, output, watermark: bool = True,
+                         max_chunk_duration: float = 45.0,
+                         target_chunk_duration: float = 37.0,
+                         crossfade_ms: float = 50.0,
+                         progress_callback=None,
+                         **kwargs):
+        # Auto-route to generate_long when the requested duration (explicit
+        # gen_duration if set, otherwise prompt-estimated) exceeds the chunk
+        # cap. Single-shot path otherwise — same as before, no regression for
+        # short prompts.
+        explicit_dur = float(kwargs.get("gen_duration") or 0.0)
+        est_dur = explicit_dur if explicit_dur > 0 else estimate_duration(
+            prompt, kwargs.get("duration_multiplier", 1.1))
+
+        if est_dur > max_chunk_duration:
+            waveform, sr = self.generate_long(
+                prompt,
+                max_chunk_duration=max_chunk_duration,
+                target_chunk_duration=target_chunk_duration,
+                crossfade_ms=crossfade_ms,
+                progress_callback=progress_callback,
+                **kwargs,
+            )
+        else:
+            if progress_callback is not None:
+                try:
+                    progress_callback(0, 1, est_dur)
+                except Exception:
+                    pass
+            waveform, sr = self.generate(prompt, **kwargs)
         wav_cpu = waveform.cpu().float()
         if watermark:
             try:

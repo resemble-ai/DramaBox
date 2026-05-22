@@ -18,6 +18,8 @@ import spaces
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 from inference_server import TTSServer  # noqa: E402
 from model_downloader import get_all_paths  # noqa: E402
+from duration_estimator import estimate_speech_duration  # noqa: E402
+from text_chunker import chunk_prompt_for_duration  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -164,14 +166,57 @@ EXAMPLES: list[tuple[str, str, str]] = [
 ]
 
 
-@spaces.GPU(duration=120)
+def preview_chunks(prompt: str, dur_mult: float, max_chunk_s: float,
+                   target_chunk_s: float) -> str:
+    """Markdown blurb shown live under the prompt box.
+
+    Recomputes the duration estimate + chunk plan on every keystroke. Cheap
+    (pure-Python ``estimate_speech_duration`` + sentence state machine), so
+    Gradio's debounced ``.change()`` handler runs it without measurable lag.
+    """
+    if not prompt or not prompt.strip():
+        return ""
+    raw = estimate_speech_duration(prompt) * float(dur_mult)
+    if raw <= max_chunk_s:
+        return (
+            f"📏 **Estimated duration:** ~{raw:.1f} s · "
+            f"**single-shot** (under {max_chunk_s:.0f} s cap)."
+        )
+    chunks = chunk_prompt_for_duration(
+        prompt,
+        max_duration_s=float(max_chunk_s),
+        target_duration_s=float(target_chunk_s),
+        duration_multiplier=float(dur_mult),
+    )
+    parts = " · ".join(f"{c.est_duration_s:.1f}s" for c in chunks)
+    return (
+        f"📏 **Estimated duration:** ~{raw:.1f} s · "
+        f"**{len(chunks)} chunks** ({parts}) · target {target_chunk_s:.0f} s, "
+        f"max {max_chunk_s:.0f} s · stitched with crossfade."
+    )
+
+
+@spaces.GPU(duration=600)
 def on_generate(prompt: str, audio_ref, cfg: float, stg: float, dur_mult: float,
-                gen_dur: float, ref_dur: float, seed: int):
+                gen_dur: float, ref_dur: float, seed: int, upsampler: str,
+                denoise_ref: bool,
+                max_chunk_s: float, target_chunk_s: float, crossfade_ms: float,
+                progress=gr.Progress()):
     if not prompt or not prompt.strip():
         raise gr.Error("Prompt is empty.")
     t0 = time.time()
     ref_path = audio_ref if audio_ref and os.path.exists(str(audio_ref)) else None
     output = tempfile.mktemp(suffix=".wav", prefix="dramabox_", dir="output")
+    sr_kwargs = {"chunk_size_s": 1.0, "hop_portion": 0.5} if upsampler == "reuse" else None
+
+    def _on_chunk(idx: int, total: int, est_s: float) -> None:
+        # idx is 0-indexed; show as "chunk 1/N starting".
+        if total <= 1:
+            progress(0.0, desc=f"Generating ~{est_s:.1f} s of audio")
+        else:
+            progress(idx / total,
+                     desc=f"Chunk {idx + 1}/{total} — generating ~{est_s:.1f} s")
+
     tts.generate_to_file(
         prompt=prompt,
         output=output,
@@ -180,9 +225,16 @@ def on_generate(prompt: str, audio_ref, cfg: float, stg: float, dur_mult: float,
         duration_multiplier=dur_mult, seed=int(seed),
         gen_duration=float(gen_dur),
         ref_duration=float(ref_dur),
+        upsampler=upsampler,
+        sr_kwargs=sr_kwargs,
+        denoise_ref=bool(denoise_ref),
+        max_chunk_duration=float(max_chunk_s),
+        target_chunk_duration=float(target_chunk_s),
+        crossfade_ms=float(crossfade_ms),
+        progress_callback=_on_chunk,
     )
     elapsed = time.time() - t0
-    logging.info(f"Generated in {elapsed:.2f}s -> {output}")
+    logging.info(f"Generated in {elapsed:.2f}s ({upsampler}, denoise_ref={denoise_ref}) -> {output}")
     return output
 
 
@@ -202,6 +254,18 @@ _BANNER_CSS = """
 .ltx-banner a { color: #ff9a6c; font-weight: 600; text-decoration: none; }
 .ltx-banner a:hover { text-decoration: underline; }
 .ltx-banner strong { color: #ffffff; }
+.chunk-preview {
+    font-size: 12px !important;
+    color: #a0a0b8 !important;
+    padding: 4px 8px !important;
+    margin: 4px 0 8px 0 !important;
+    border-left: 2px solid #ff6b35;
+    background: rgba(255, 107, 53, 0.05);
+    border-radius: 3px;
+    min-height: 0 !important;
+}
+.chunk-preview:empty { display: none; }
+.chunk-preview p { margin: 0 !important; }
 """
 
 with gr.Blocks(
@@ -226,7 +290,10 @@ with gr.Blocks(
         "[Resemble Perth](https://github.com/resemble-ai/Perth).\n\n"
         "**Tips:** put dialogue inside `\"double quotes\"`, scene directions outside. "
         "Phonetic sounds (`\"Hahaha\"`, `\"Mmmm\"`, `\"Ugh\"`) go inside quotes; named "
-        "actions (`She sighs.`, `He clears his throat.`) go outside."
+        "actions (`She sighs.`, `He clears his throat.`) go outside.\n\n"
+        "**Long prompts (>45s estimated):** automatically split at sentence boundaries "
+        "into ~37s chunks, generated with the same voice reference + seed, and stitched "
+        "back together with an inaudible 50 ms crossfade."
     )
 
     with gr.Row():
@@ -236,6 +303,7 @@ with gr.Blocks(
                 placeholder=EXAMPLES[0][2],
                 lines=6, elem_classes=["prompt-box"],
             )
+            chunk_preview = gr.Markdown("", elem_classes=["chunk-preview"])
             audio_ref = gr.Audio(
                 label="Voice reference (optional, 10+ seconds)",
                 type="filepath",
@@ -248,13 +316,63 @@ with gr.Blocks(
                 stg_slider = gr.Slider(0.0, 5.0, value=1.5, step=0.5, label="STG scale")
                 dur_slider = gr.Slider(0.8, 2.0, value=1.1, step=0.05,
                                        label="Duration × (only used when target duration = 0)")
-                gen_dur_slider = gr.Slider(0.0, 60.0, value=0.0, step=1.0,
+                gen_dur_slider = gr.Slider(0.0, 600.0, value=0.0, step=1.0,
                                            label="Target duration (s) — 0 = auto from prompt; "
-                                                 "set higher (≥20s) for long-form music or scenes")
+                                                 "values >45s automatically chunk the prompt "
+                                                 "(see info under prompt box)")
                 ref_dur_slider = gr.Slider(3.0, 30.0, value=10.0, step=1.0,
                                            label="Reference duration (s) — how many seconds of the "
                                                  "uploaded voice reference the model conditions on")
                 seed_input = gr.Number(value=42, label="Seed", precision=0)
+                upsampler_choice = gr.Radio(
+                    choices=[
+                        ("LTX BigVGAN BWE (built-in, fast — recommended)", "ltx"),
+                        ("RE-USE — output-side denoise + 48 kHz (suppresses laughs/sighs)", "reuse"),
+                    ],
+                    value="ltx",
+                    label="24→48 kHz upsampler",
+                    info=("Default = LTX BWE. RE-USE on the OUTPUT tends to suppress "
+                          "paralinguistic events (laughs, gasps, sighs) as broadband noise. "
+                          "We now run RE-USE on the *reference* instead (see below) — that "
+                          "gives clean speaker identity without touching generated content."),
+                )
+                denoise_ref_check = gr.Checkbox(
+                    value=True,
+                    label="Denoise voice reference (RE-USE on input)",
+                    info=("Run RE-USE on the uploaded voice reference before "
+                          "conditioning. The model generalises a cleaner speaker / "
+                          "style anchor from it, preserving generated paralinguistic "
+                          "content (laughs, breaths, sighs). Cached per session, so "
+                          "chunked generations don't re-denoise."),
+                )
+            with gr.Accordion("Long-form options (chunking + crossfade)", open=False):
+                gr.Markdown(
+                    "When the estimated duration exceeds the **max chunk** cap, "
+                    "the prompt is split at sentence boundaries (quote-aware), "
+                    "each chunk is generated with the same voice reference + seed, "
+                    "and chunks are stitched with an equal-power crossfade. "
+                    "Defaults are tuned to the LTX-2.3 base model's well-trained "
+                    "regime — only adjust if you know what you're doing."
+                )
+                max_chunk_slider = gr.Slider(
+                    20.0, 60.0, value=45.0, step=1.0,
+                    label="Max chunk duration (s)",
+                    info="Hard cap; chunks above this are rare-but-possible "
+                         "tail emissions. The base model degrades past ~45 s.",
+                )
+                target_chunk_slider = gr.Slider(
+                    15.0, 50.0, value=37.0, step=1.0,
+                    label="Target chunk duration (s)",
+                    info="Soft cap; new sentences stop being added once a "
+                         "chunk would cross this. 5-10 s headroom under max "
+                         "absorbs estimator under-shoot.",
+                )
+                crossfade_slider = gr.Slider(
+                    0.0, 250.0, value=50.0, step=5.0,
+                    label="Crossfade (ms)",
+                    info="Equal-power overlap between adjacent chunks. "
+                         "50 ms is inaudible on speech; 0 ms = hard cut.",
+                )
             audio_out = gr.Audio(label="Generated audio", type="filepath")
             with gr.Accordion("Prompt writing guide", open=False):
                 gr.Markdown(
@@ -268,10 +386,22 @@ with gr.Blocks(
                     "**Avoid inside quotes:** Ahem, Pfft, Sigh, Gasp, Cough — the model speaks them literally."
                 )
 
+    # Live chunk-plan preview. Pure-Python estimator + state-machine split,
+    # so re-running on every keystroke is free.
+    for trigger in (prompt_box, dur_slider, max_chunk_slider, target_chunk_slider):
+        trigger.change(
+            preview_chunks,
+            inputs=[prompt_box, dur_slider, max_chunk_slider, target_chunk_slider],
+            outputs=[chunk_preview],
+            show_progress="hidden",
+        )
+
     gen_btn.click(
         on_generate,
         inputs=[prompt_box, audio_ref, cfg_slider, stg_slider,
-                dur_slider, gen_dur_slider, ref_dur_slider, seed_input],
+                dur_slider, gen_dur_slider, ref_dur_slider, seed_input,
+                upsampler_choice, denoise_ref_check,
+                max_chunk_slider, target_chunk_slider, crossfade_slider],
         outputs=[audio_out],
     )
 
@@ -281,19 +411,25 @@ with gr.Blocks(
         label="🎬 Click any row to generate a sample",
         examples=[
             # rows tagged "30s •" force a 30-second target duration; the rest
-            # use the prompt-driven auto estimate (gen_dur = 0).
+            # use the prompt-driven auto estimate (gen_dur = 0). New pipeline:
+            # upsampler="ltx" (no output denoise) + denoise_ref=True
+            # (input-side RE-USE) keeps generated laughs / sighs intact.
             [name, prompt, voice_path, 2.5, 1.5, 1.1,
-             30.0 if name.startswith("30s") else 0.0, 10.0, 42]
+             30.0 if name.startswith("30s") else 0.0, 10.0, 42, "ltx", True,
+             45.0, 37.0, 50.0]
             for name, voice_path, prompt in EXAMPLES
         ],
         example_labels=[name for name, _, _ in EXAMPLES],
         inputs=[gr.Textbox(visible=False, label="Scene"),
                 prompt_box, audio_ref,
                 cfg_slider, stg_slider, dur_slider, gen_dur_slider,
-                ref_dur_slider, seed_input],
+                ref_dur_slider, seed_input, upsampler_choice, denoise_ref_check,
+                max_chunk_slider, target_chunk_slider, crossfade_slider],
         outputs=[audio_out],
-        fn=lambda _name, prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed: on_generate(
-            prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed),
+        fn=lambda _name, prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed, ups,
+                  dn_ref, max_ch, tgt_ch, xfade: on_generate(
+            prompt, ref, cfg, stg, dur, gen_dur, ref_dur, seed, ups, dn_ref,
+            max_ch, tgt_ch, xfade),
         cache_examples=False,
         run_on_click=True,
         examples_per_page=20,
@@ -304,9 +440,11 @@ if __name__ == "__main__":
     # HF Spaces routes external traffic to container port 7860 by default.
     # Defaulting to 7861 caused the gateway to return 500 for every external request.
     port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+    # GRADIO_SHARE defaults to "1" so `python app.py` produces a public *.gradio.live
+    # link for sharing with teammates. Set GRADIO_SHARE=0 to keep it LAN-only.
     app.queue(max_size=10).launch(
         server_name="0.0.0.0", server_port=port,
-        share=os.environ.get("GRADIO_SHARE", "0") == "1",
+        share=os.environ.get("GRADIO_SHARE", "1") == "1",
         ssr_mode=False,                       # Gradio 5 SSR + ZeroGPU fork has known race conditions
         show_api=False,                       # don't auto-derive Python schemas (caused bool-iter / dict-cache crashes)
     )

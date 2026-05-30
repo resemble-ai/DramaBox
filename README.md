@@ -35,6 +35,22 @@ Auto-downloaded from the HF model repo on first run.
 
 **VRAM**: ~24 GB peak · **Speed**: ~2.5 s / generation (warm server, H100)
 
+## Installation
+
+Requires Python 3.10+ and an NVIDIA GPU with CUDA (~24 GB VRAM for inference).
+
+```bash
+git clone https://github.com/resemble-ai/DramaBox.git
+cd DramaBox
+
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt
+```
+
+Model weights are auto-downloaded from the [HF model repo](https://huggingface.co/ResembleAI/Dramabox) on first run. To control the download location, set the standard `HF_HOME` environment variable before running.
+
 ## Quick Start
 
 ### Warm server (recommended)

@@ -40,8 +40,8 @@ Auto-downloaded from the HF model repo on first run.
 Requires Python 3.10+ and an NVIDIA GPU with CUDA (~24 GB VRAM for inference).
 
 ```bash
-git clone https://github.com/rosmur/dramabox.git
-cd dramabox
+git clone https://github.com/resemble-ai/DramaBox.git
+cd DramaBox
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate

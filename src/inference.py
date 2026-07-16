@@ -287,7 +287,7 @@ def main():
     use_cfg = args.cfg_scale > 1.0
     logging.info("Encoding prompt...")
     pe = PromptEncoder(checkpoint_path=args.full_checkpoint, gemma_root=args.gemma_root, dtype=dtype, device=device,
-                       use_bnb_4bit=args.bnb_4bit, warm=True)
+                       use_bnb_4bit=args.bnb_4bit, warm=True, audio_only=True)
     prompts_to_encode = [args.prompt]
     if use_cfg:
         prompts_to_encode.append(args.negative_prompt)

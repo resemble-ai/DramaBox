@@ -6,6 +6,13 @@
 
 # DramaBox — Expressive TTS with Voice Cloning
 
+> [!IMPORTANT]
+> **As of August 2026, DramaBox and the rest of the Chatterbox research family are retired and no longer maintained.**
+>
+> Resemble AI does not sell text-to-speech, voice cloning, or any other voice AI product, and this repository is not a Resemble AI product. The repository stays public as a research archive under its existing license terms (see [LICENSE](LICENSE)), with no support, updates, or paid tier from Resemble AI.
+>
+> Resemble AI now builds AI detection models for deepfakes, synthetic media, and AI agents. [Read why we went all in on deepfake detection.](https://www.resemble.ai/resources/why-a-former-voice-ai-company-went-all-in-on-deepfake-detection)
+
 [![Alt Text](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://huggingface.co/spaces/ResembleAI/Dramabox)
 [![Discord](https://img.shields.io/discord/1377773249798344776?label=join%20discord&logo=discord&style=flat)](https://discord.gg/rJq9cRJBJ6)
 
